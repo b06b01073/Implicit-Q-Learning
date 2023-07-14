@@ -19,19 +19,20 @@ class IQLAgent:
         self.env = gym.make(args.env_name)
         self.action_dim = self.env.action_space.shape[0]
         self.obs_dim = self.env.observation_space.shape[0]
+        self.max_action = torch.from_numpy(self.env.action_space.high).to(device)
 
         # get dataset
         self.dataset = self.init_datset()
       
         # network initialization 
         self.hidden_dim = args.hidden_dim
-        self.Q_net = MLP(input_dim=self.action_dim + self.obs_dim, output_dim=1, hidden_dim=self.hidden_dim).to(device)
-        self.target_Q_net = MLP(input_dim=self.action_dim + self.obs_dim, output_dim=1, hidden_dim=self.hidden_dim).to(device)
+        self.Q_net = DoubleQ(input_dim=self.action_dim + self.obs_dim, output_dim=1, hidden_dim=self.hidden_dim).to(device)
+        self.target_Q_net = DoubleQ(input_dim=self.action_dim + self.obs_dim, output_dim=1, hidden_dim=self.hidden_dim).to(device)
         self.hard_update(self.Q_net, self.target_Q_net)
 
         self.V_net = MLP(input_dim=self.obs_dim, output_dim=1, hidden_dim=self.hidden_dim).to(device)
 
-        self.actor = Actor(obs_dim=self.obs_dim, action_dim=self.action_dim, hidden_dim=self.hidden_dim).to(device)
+        self.actor = Actor(obs_dim=self.obs_dim, action_dim=self.action_dim, hidden_dim=self.hidden_dim, max_action=self.max_action).to(device)
 
         # hyperparameters
         self.batch_size = args.batch_size
@@ -49,7 +50,11 @@ class IQLAgent:
         self.actor_optim = optim.Adam(params=self.actor.parameters(), lr=self.learning_rate)
         self.expectile_loss = expectile_loss
         self.mse_loss = nn.MSELoss()
-        # self.awr_loss = awr_loss
+
+
+        # evaluation
+        self.eval_episode = args.eval_episode
+        self.normalize_score = args.normalize_score
 
     
     def train(self):
@@ -75,7 +80,7 @@ class IQLAgent:
             observations, actions, rewards, next_observations, terminals = self.get_batch_data()
 
             # update value network
-            target = self.target_Q_net(torch.cat((observations, actions), dim=1)).detach()
+            target = torch.min(*self.target_Q_net(torch.cat((observations, actions), dim=1))).detach()
             state_value = self.V_net(observations)
             value_loss = self.expectile_loss(input=state_value, target=target, tau=self.tau)
 
@@ -85,8 +90,10 @@ class IQLAgent:
 
             # update action value network
             target = rewards + self.gamma * (1 - terminals) * self.V_net(next_observations).squeeze()
-            state_action_value = self.Q_net(torch.cat((observations, actions), dim=1)).flatten()
-            q_loss = self.mse_loss(target.detach(), state_action_value)
+            q1, q2 = self.Q_net(torch.cat((observations, actions), dim=1))
+            q1 = q1.flatten()
+            q2 = q2.flatten()
+            q_loss = self.mse_loss(target.detach(), q1) + self.mse_loss(target.detach(), q2)
 
             self.Q_optim.zero_grad()
             q_loss.backward()
@@ -99,11 +106,11 @@ class IQLAgent:
 
     
     def AWR(self):
-        for i in tqdm(range(self.gradient_step), desc='extracing policy'):
+        for i in tqdm(range(self.gradient_step), desc='extracting policy'):
             # caluate expoentiated advantage 
             observations, actions, _, _, _ = self.get_batch_data()
-            adv = (self.target_Q_net(torch.cat((observations, actions), dim=1)) - self.V_net(observations))
-
+            adv = torch.min(*self.target_Q_net(torch.cat((observations, actions), dim=1))) - self.V_net(observations)
+            
             adv_weight = torch.clip(torch.exp(self.beta * (adv)), max=self.max_adv).detach()
 
             # get log prob from policy
@@ -111,7 +118,6 @@ class IQLAgent:
             
             # calculate loss and update actor
             actor_loss = (-adv_weight * action_log_prob).mean()
-
             self.actor_optim.zero_grad()
             actor_loss.backward()
             self.actor_optim.step()
@@ -124,7 +130,28 @@ class IQLAgent:
         dataset = d4rl.qlearning_dataset(self.env)
         dataset['terminals'] = dataset['terminals'].astype(np.int64)
 
+        print(f'Dataset size: {len(dataset["observations"])}')
         return dataset
+    
+    
+    def evaluate(self):
+        scores = []
+        for _ in tqdm(range(self.eval_episode), desc='evaluating'):
+            obs = self.env.reset()
+            score = 0
+            while True:
+                with torch.no_grad():
+                    action = self.actor.sample(obs)
+                obs, reward, terminated, _ = self.env.step(action)
+                score += reward
+    
+                if terminated:
+                    break
+
+            
+            scores.append(self.env.get_normalized_score(score) if self.normalize_score else score)
+                
+        print(f'average score: {np.mean(scores)}')
     
 
     def hard_update(self, src, target):
@@ -138,7 +165,7 @@ class IQLAgent:
     
 
 class MLP(nn.Module):
-    def __init__(self,input_dim, output_dim, hidden_dim=256):
+    def __init__(self, input_dim, output_dim, hidden_dim):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -151,13 +178,24 @@ class MLP(nn.Module):
         return self.network(x)
     
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+class DoubleQ(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim):
         super().__init__()
+        self.q1 = MLP(input_dim, output_dim, hidden_dim)
+        self.q2 = MLP(input_dim, output_dim, hidden_dim)
+
+    
+    def forward(self, x):
+        return self.q1(x), self.q2(x)
+
+
+class Actor(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden_dim, max_action):
+        super().__init__()
+        self.max_action = max_action
+
         self.header = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
 
@@ -167,8 +205,8 @@ class Actor(nn.Module):
 
     def forward(self, x):
         x = self.header(x)
-        means = torch.exp(self.mean(x)) # this trick keeps the std always > 0
-        stds = torch.exp(self.log_std(x)) # this trick keeps the std always > 0
+        means = torch.tanh(self.mean(x)) * self.max_action
+        stds = torch.exp(self.log_std(x)) # this trick keeps std always > 0
 
         return means, stds
     
@@ -177,6 +215,13 @@ class Actor(nn.Module):
         means, stds = self.forward(observations)
         normal = Normal(means, stds)
         return normal.log_prob(actions)
+    
+    
+    def sample(self, obs, deterministic=True):
+        obs = torch.from_numpy(obs).float().to(device)
+        mean, std = self.forward(obs)
+        if deterministic:
+            return mean.cpu().detach().numpy()
 
 
 def expectile_loss(input, target, tau):
@@ -188,6 +233,3 @@ def expectile_loss(input, target, tau):
     asymmtric_coef = torch.abs((tau - torch.gt(input, target).type(torch.LongTensor).to(device))).detach()
 
     return torch.mean(asymmtric_coef * ((input - target) ** 2))
-
-
-# def awr_loss(q_value, baseline)
