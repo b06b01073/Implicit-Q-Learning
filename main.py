@@ -11,6 +11,10 @@ if __name__ == '__main__':
     parser.add_argument('--discount_factor', '-d', type=float, default=0.99)
     parser.add_argument('--tau', '-t', help='expectile', type=float, default=0.7)
     parser.add_argument('--alpha', '-a', help='soft update ratio', type=float, default=5e-3)
+    parser.add_argument('--beta', help='actor temperature', type=float, default=3.0)
+    parser.add_argument('--max_adv', help='maximum weight of exponentiated advantage', type=float, default=100)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+
     args = parser.parse_args()
     
     # train
