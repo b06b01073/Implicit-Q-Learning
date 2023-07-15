@@ -16,6 +16,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--eval_episode', type=int, default=10)
     parser.add_argument('--normalize_score', action='store_false')
+    parser.add_argument('--write_file', type=str, default='result.txt')
 
     args = parser.parse_args()
     

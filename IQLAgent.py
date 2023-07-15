@@ -16,7 +16,8 @@ print(f'Training with {device}')
 class IQLAgent:
     def __init__(self, args):
         # meta data and env
-        self.env = gym.make(args.env_name)
+        self.env_name = args.env_name
+        self.env = gym.make(self.env_name)
         self.action_dim = self.env.action_space.shape[0]
         self.obs_dim = self.env.observation_space.shape[0]
         self.max_action = torch.from_numpy(self.env.action_space.high).to(device)
@@ -55,6 +56,7 @@ class IQLAgent:
         # evaluation
         self.eval_episode = args.eval_episode
         self.normalize_score = args.normalize_score
+        self.write_file = args.write_file
 
     
     def train(self):
@@ -130,12 +132,13 @@ class IQLAgent:
         dataset = d4rl.qlearning_dataset(self.env)
         dataset['terminals'] = dataset['terminals'].astype(np.int64)
 
-        print(f'Dataset size: {len(dataset["observations"])}')
+        print(f'Dataset size({self.env_name}): {len(dataset["observations"])}')
         return dataset
     
     
     def evaluate(self):
-        scores = []
+        ori_scores = []
+        normalized_scores = [] 
         for _ in tqdm(range(self.eval_episode), desc='evaluating'):
             obs = self.env.reset()
             score = 0
@@ -149,9 +152,13 @@ class IQLAgent:
                     break
 
             
-            scores.append(self.env.get_normalized_score(score) if self.normalize_score else score)
-                
-        print(f'average score: {np.mean(scores)}')
+            ori_scores.append(score)
+            normalized_scores.append(self.env.get_normalized_score(score))
+
+        print(f'average normalized score: {np.mean(normalized_scores)}')
+
+        with open(self.write_file, 'a') as f:
+            f.write(f'{self.env_name},{np.mean(ori_scores)},{np.mean(normalized_scores)}\n')
     
 
     def hard_update(self, src, target):
